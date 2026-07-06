@@ -2,8 +2,8 @@ import os
 from pathlib import Path
 import pandas as pd
 import shutil
-from ANALYSES import download_VGG_full_updated as download
-from ANALYSES.config import DURATION, WIDTH, HEIGHT, FRAMERATE, NBFRAMES, SAMPLERATE_DNN, BITRATE_DNN
+import processin_functions as process
+from config import DURATION, WIDTH, HEIGHT, FRAMERATE, NBFRAMES, SAMPLERATE_DNN, BITRATE_DNN
 
 
 source_path =  "../data/videos" # VGGSound videos
@@ -85,11 +85,11 @@ df.to_csv(multimodal_dataset_csv_path_unfiltered, index=False)
 
 
 ### Extract video and audio from merged files
-download.extract_video_audio_from_DIRECTORY(raw_video_path, raw_audio_path, source_path, video_error_csv_path, audio_error_csv_path)
+process.extract_video_audio_from_DIRECTORY(raw_video_path, raw_audio_path, source_path, video_error_csv_path, audio_error_csv_path)
 
 # %%
 ### Extract video meta data
-download.extract_metadata(raw_video_path, video_metrics_path_unprocessed, "video")
+process.extract_metadata(raw_video_path, video_metrics_path_unprocessed, "video")
 
 ### Filter raw video quality
 df_video = pd.read_csv(video_metrics_path_unprocessed)
@@ -102,13 +102,13 @@ df_video.to_csv(video_csv_path, index=False)
 
 ### Equalise frame rate, duration, size
 # For human viewing and to merge the videos again at the end:
-download.reencode_files(video_csv_path, raw_video_path, video_path, "mp4", "merger") # same as "human"
+process.reencode_files(video_csv_path, raw_video_path, video_path, "mp4", "merger") # same as "human"
 # For DNN - adapt config.py (# video encoding):
-download.reencode_files(video_csv_path, raw_video_path, video_path_frames, "mp4", "dnn")
+process.reencode_files(video_csv_path, raw_video_path, video_path_frames, "mp4", "dnn")
 
 # %%
 ### Extract audio meta data
-download.extract_metadata(raw_audio_path, audio_metrics_path_unprocessed, "audio")
+process.extract_metadata(raw_audio_path, audio_metrics_path_unprocessed, "audio")
 
 ### Filter raw audio quality
 df_audio = pd.read_csv(audio_metrics_path_unprocessed)
@@ -120,11 +120,11 @@ df_audio.to_csv(audio_csv_path, index=False)
 
 ### Equalise sample rate, duration, channels
 # To merge the videos again at the end:
-download.reencode_files(audio_csv_path, raw_audio_path, audio_path, "m4a", "merger")
+process.reencode_files(audio_csv_path, raw_audio_path, audio_path, "m4a", "merger")
 # For DNN - adapt config.py (# audio encoding):
-download.reencode_files(audio_csv_path, raw_audio_path, audio_path_mono,"m4a", "dnn")
+process.reencode_files(audio_csv_path, raw_audio_path, audio_path_mono,"m4a", "dnn")
 # For human listening:
-#download.reencode_files(audio_csv_path, raw_audio_path, audio_path_stereo, "m4a", "human")
+#process.reencode_files(audio_csv_path, raw_audio_path, audio_path_stereo, "m4a", "human")
 
 # %%
 ### Discard the files that were filtered out
@@ -192,8 +192,8 @@ os.remove(multimodal_dataset_csv_path_unfiltered) # it was a copy of the VGGSoun
 
 # %%
 ### Extract metadata of preprocessed and selected files
-download.extract_metadata(video_path, video_metrics_path, "video")
-download.extract_metadata(audio_path_mono, audio_metrics_path, "audio")
+process.extract_metadata(video_path, video_metrics_path, "video")
+process.extract_metadata(audio_path_mono, audio_metrics_path, "audio")
 
 
 # %%
@@ -213,4 +213,4 @@ filter_files(video_metrics_path, audio_metrics_path, multimodal_dataset_csv_path
 
 # %%
 ### Merge video and audio
-download.merge_video_audio(video_path, audio_path, merged_video_path)
+process.merge_video_audio(video_path, audio_path, merged_video_path)
