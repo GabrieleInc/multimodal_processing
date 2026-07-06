@@ -66,21 +66,15 @@ for path in [root_path,
 
 # Load VGGSound CSV (without header)
 df = pd.read_csv(source_csv_path, header=None)
-
-# Add column names
 df.columns = ["video_id", "label_code", "label", "split"]
-
 # Ensure label_code is a string
 df["label_code"] = df["label_code"].astype(str)
-
 # Create unique_id: video_id + "_" + label_code padded to 6 digits
 df.insert(
     0,
     "unique_id",
     df["video_id"].astype(str) + "_" + df["label_code"].str.zfill(6)
 )
-
-# Save
 df.to_csv(multimodal_dataset_csv_path_unfiltered, index=False)
 
 
