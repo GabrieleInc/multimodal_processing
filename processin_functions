@@ -9,7 +9,7 @@ import json
 import threading
 import re
 import subprocess
-from ANALYSES.config import DURATION, WIDTH, HEIGHT, FRAMERATE, FRAMES_DNN, SAMPLERATE_DNN, NBCHANNELS_DNN
+from config import DURATION, WIDTH, HEIGHT, FRAMERATE, FRAMES_DNN, SAMPLERATE_DNN, NBCHANNELS_DNN
 
 os.environ["PYTHONHASHSEED"] = "42"
 random.seed(42)
