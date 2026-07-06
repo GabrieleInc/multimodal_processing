@@ -1,0 +1,715 @@
+import os
+import random
+import numpy as np
+import pandas as pd
+import glob
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import itertools
+import json
+import threading
+import re
+import subprocess
+from ANALYSES.config import DURATION, WIDTH, HEIGHT, FRAMERATE, FRAMES_DNN, SAMPLERATE_DNN, NBCHANNELS_DNN
+
+os.environ["PYTHONHASHSEED"] = "42"
+random.seed(42)
+np.random.seed(42)
+
+# FFMPEG_PATH = "/Users/gabrieleinciuraite/PycharmProjects/Multimodal/ffmpeg-bin/ffmpeg" # built with resampler:soxr, if needed for human data
+
+######################################################
+
+# Extract video and audio separately from the downloaded files
+
+def has_stream(file_path, stream_type):
+    """Check if the file contains the specified stream type (video or audio)."""
+    cmd = [
+        "ffprobe", "-v", "error", "-select_streams", stream_type,
+        "-show_entries", "stream=index", "-of", "csv=p=0", file_path
+    ]
+    return bool(subprocess.run(cmd, stdout=subprocess.PIPE).stdout.strip())
+
+def _extract_one(filename, video_path, audio_path, source_dir,
+                 video_results, audio_results, lock):
+    clip_name = os.path.splitext(filename)[0]
+    source_mp4 = os.path.join(source_dir, filename)
+    video_file = os.path.join(video_path, clip_name + ".mp4")
+    audio_file = os.path.join(audio_path, clip_name + ".m4a")
+
+    def record_video(code, msg):
+        with lock:
+            video_results[clip_name] = {
+                "File": clip_name, "Video_Error_Code": code, "Video_Error_Message": msg,
+            }
+
+    def record_audio(code, msg):
+        with lock:
+            audio_results[clip_name] = {
+                "File": clip_name, "Audio_Error_Code": code, "Audio_Error_Message": msg,
+            }
+
+    # --- Probe duration (needed for both streams) ---
+    probe_command = [
+        "ffprobe", "-v", "error", "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1", source_mp4,
+    ]
+    probe_result = subprocess.run(probe_command, text=True, capture_output=True)
+    if probe_result.returncode != 0:
+        print(f"ffprobe failed for {filename}: {probe_result.stderr}")
+        record_video(probe_result.returncode, probe_result.stderr.strip())
+        record_audio(probe_result.returncode, probe_result.stderr.strip())
+        return
+
+    total_duration = float(probe_result.stdout.strip())
+    mid = total_duration / 2
+    clip_start = max(0, mid - 1.5)
+    clip_end = min(total_duration, mid + 1.5)
+
+    # --- Video (no audio) ---
+    if not os.path.exists(video_file):
+        if not has_stream(source_mp4, "v"):
+            record_video(None, "no video stream")
+        else:
+            cmd = [
+                "ffmpeg", "-y",
+                "-ss", f"{clip_start:.3f}", "-to", f"{clip_end:.3f}",
+                "-i", source_mp4, "-an", "-c:v", "copy", video_file,
+            ]
+            r = subprocess.run(cmd, text=True, capture_output=True)
+            if r.returncode != 0:
+                print(f"  Video extraction failed ({filename}): {r.stderr}")
+                record_video(r.returncode, r.stderr.strip())
+
+    # --- Audio only ---
+    if not os.path.exists(audio_file):
+        if not has_stream(source_mp4, "a"):
+            record_audio(None, "no audio stream")
+        else:
+            cmd = [
+                "ffmpeg", "-y",
+                "-ss", f"{clip_start:.3f}", "-to", f"{clip_end:.3f}",
+                "-i", source_mp4, "-vn", "-c:a", "copy", audio_file,
+            ]
+            r = subprocess.run(cmd, text=True, capture_output=True)
+            if r.returncode != 0:
+                print(f"  Audio extraction failed ({filename}): {r.stderr}")
+                record_audio(r.returncode, r.stderr.strip())
+
+import csv
+def _write_csv(path, fieldnames, results):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        for clip_name in sorted(results):
+            writer.writerow(results[clip_name])
+    print(f"Wrote {len(results)} record(s) to {path}")
+
+
+def extract_video_audio_from_DIRECTORY(video_path, audio_path, source_dir,
+                                       video_csv_path, audio_csv_path):
+    """
+    Extract the middle 3s video/audio from all MP4s in source_dir (threaded).
+    Error/skip reports are written to video_csv_path and audio_csv_path.
+    """
+    video_results = {}
+    audio_results = {}
+
+    mp4_files = [f for f in os.listdir(source_dir) if f.lower().endswith(".mp4")]
+    if not mp4_files:
+        print(f"No MP4 files found in: {source_dir}")
+        _write_csv(video_csv_path, ["File", "Video_Error_Code", "Video_Error_Message"], video_results)
+        _write_csv(audio_csv_path, ["File", "Audio_Error_Code", "Audio_Error_Message"], audio_results)
+        return
+
+    lock = threading.Lock()
+    num_threads = min(len(mp4_files), os.cpu_count() or 1)
+
+    with ThreadPoolExecutor(max_workers=num_threads) as executor:
+        futures = [
+            executor.submit(_extract_one, f, video_path, audio_path, source_dir,
+                            video_results, audio_results, lock)
+            for f in mp4_files
+        ]
+        for fut in as_completed(futures):
+            try:
+                fut.result()  # surface any exception raised inside a worker
+            except Exception as e:
+                print(f"Worker crashed: {e}")
+
+    _write_csv(video_csv_path, ["File", "Video_Error_Code", "Video_Error_Message"], video_results)
+    _write_csv(audio_csv_path, ["File", "Audio_Error_Code", "Audio_Error_Message"], audio_results)
+
+######################################################
+
+# Extract meta data
+
+def get_video_metadata(file_name, video_path):
+    """Extract resolution, bitrate, and frame rate using ffprobe."""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height,r_frame_rate,avg_frame_rate,duration,bit_rate,nb_frames",
+        "-of", "csv=p=0",
+        video_path
+    ]
+    try:
+        output = subprocess.check_output(cmd).decode().strip()
+        fields = [p for p in output.strip().split(',') if p]
+        width, height, frame_rate, avg_frame_rate, duration, bitrate, nb_frames = fields
+        # print(width, height, frame_rate, duration, bitrate, nb_frames)
+        # Convert values to the appropriate types
+        width = int(width)
+        height = int(height)
+        duration = float(duration)
+        bitrate = int(bitrate)
+        nb_frames = int(nb_frames)
+        frame_rate = eval(frame_rate) # Parse as a fraction (e.g., "25/1")
+        avg_frame_rate = eval(avg_frame_rate) # Parse as a fraction (e.g., "25/1")
+    except Exception as e:
+        print(f"ERROR getting metadata for {video_path}: {e}")
+        width = height = frame_rate = avg_frame_rate = duration = bitrate = nb_frames = None
+
+    return {
+        "File": file_name,
+        "Width": width,
+        "Height": height,
+        "Aspect_Ratio": width / height if height != 0 else None,
+        "Duration": duration,
+        "Nb_frames": nb_frames,
+        "Framerate": frame_rate,  # (fps)
+        "Avg_Framerate": avg_frame_rate,  # (fps)
+        "Bitrate": bitrate,  # (bps)
+    }
+
+def get_audio_metadata(file_name, audio_path):
+    """Extract audio metadata including loudness, RMS, SNR, and spectral stats using ffprobe and librosa."""
+    # Step 1: Extract metadata using ffprobe
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "a:0",
+        "-show_entries", "stream=codec_name,sample_rate,channels,duration,bit_rate",
+        "-of", "csv=p=0",
+        audio_path
+    ]
+    try:
+        output = subprocess.check_output(cmd).decode().strip()
+        fields = [p for p in output.strip().split(',') if p]
+        # Extract fields from ffprobe output
+        codec_name = fields[0]  # Correctly extract codec name as string
+        sample_rate = int(fields[1])  # Ensure sample rate is an integer
+        channels = int(fields[2])  # Ensure channels is an integer
+        duration = float(fields[3])  # Ensure duration is float
+        bit_rate = int(fields[4])  # Ensure bit_rate is integer
+
+    except Exception as e:
+        print(f"ERROR getting metadata for {audio_path}: {e}")
+        codec_name = sample_rate = channels = duration = bit_rate = None
+
+    cmd = [
+        "ffmpeg",
+        "-i", audio_path,
+        "-af", "loudnorm=print_format=json",
+        "-f", "null", "-"
+    ]
+
+    try:
+        output = subprocess.check_output(cmd, stderr=subprocess.STDOUT).decode()
+
+        # Extract JSON block using regex
+        match = re.search(r'\{[\s\S]*?\}', output)
+        if match:
+            loudness_json = match.group(0)
+            metrics = json.loads(loudness_json)
+            # print(metrics)
+            integrated_loudness = float(metrics['input_i'])
+            true_peak = float(metrics['input_tp'])
+            loudness_range = float(metrics['input_lra'])
+            gating_thr = float(metrics['input_thresh'])
+        else:
+            print("Loudness JSON not found.")
+            integrated_loudness = true_peak = loudness_range = gating_thr = None
+
+    except subprocess.CalledProcessError as e:
+        print("Error running ffmpeg:", e.output.decode())
+        integrated_loudness = true_peak = loudness_range = gating_thr = None
+
+    # Step 2: Compute RMS and Spectral Stats using librosa
+    #y, sr = librosa.load(raw_audio_path, sr=sample_rate)
+
+    # Compute RMS
+    #rms = np.mean(librosa.feature.rms(y=y))
+
+    # Compute SNR (simplified)
+    #noise = y - np.mean(y)  # Approximate noise by subtracting the signal mean
+    #snr = 10 * np.log10(np.var(y) / np.var(noise))  # SNR in dB
+
+    # Spectral Stats
+    #spectral_centroid = np.mean(librosa.feature.spectral_centroid(y=y, sr=sr))
+    #spectral_bandwidth = np.mean(librosa.feature.spectral_bandwidth(y=y, sr=sr))
+    #spectral_flatness = np.mean(librosa.feature.spectral_flatness(y=y))
+
+    return {
+        "File": file_name,
+        "Codec_Name": codec_name,
+        "Sample_Rate": sample_rate,
+        "Channels": channels,
+        "Duration": duration,
+        "Bit_Rate": bit_rate,
+        "Integrated_Loudness": integrated_loudness,
+        "True_Peak": true_peak,
+        "Loudness_Range": loudness_range,
+        "Gating_Threshold": gating_thr,
+        #"RMS": rms,
+        #"SNR": snr,
+        #"Spectral_Centroid": spectral_centroid,
+        #"Spectral_Bandwidth": spectral_bandwidth,
+        #"Spectral_Flatness": spectral_flatness,
+    }
+
+
+def extract_metadata(input_folder, csv_output_path, data_type):
+    print("\nExtracting metadata...")
+    if data_type == "video":
+        get_metadata = get_video_metadata
+        data_formats = (".mp4")
+    elif data_type == "audio":
+        get_metadata = get_audio_metadata
+        data_formats = (".m4a", ".wav")
+
+    files = [
+        file_name for file_name in sorted(os.listdir(input_folder))
+        if file_name.endswith(data_formats)
+    ]
+
+    def process(file_name):
+        ###print(file_name, flush=True)
+        input_path = os.path.join(input_folder, file_name)
+        return get_metadata(file_name, input_path)
+
+    # Number of threads to use
+    num_threads = min(len(files), os.cpu_count())  # Use as many threads as available CPU cores
+
+    metrics = []
+    with ThreadPoolExecutor(max_workers=num_threads) as executor:
+        futures = {executor.submit(process, f): f for f in files}
+        for future in as_completed(futures):
+            try:
+                result = future.result()
+                metrics.append(result)
+            except Exception as e:
+                print(f"Error processing {futures[future]}: {e}")
+
+    # Create a DataFrame
+    df = pd.DataFrame(metrics)
+    df.to_csv(csv_output_path, index=False)
+
+    # Explicitly release threads early
+    executor.shutdown(wait=True)  # Ensures all threads finish before releasing resources
+    print("Finished extracting metadata")
+
+#########################################
+
+# Process video files
+
+# Function to process a single video
+def process_video(file_name, input_folder, output_folder, encoding, results, results_lock):
+    input_path = os.path.join(input_folder, file_name)
+    if encoding == "merger" or encoding == "human":
+        output_path = os.path.join(output_folder, file_name)
+        if os.path.exists(output_path):
+            print(f"{output_path} already exists")
+            return
+    if encoding == "dnn":
+        item_name = os.path.splitext(file_name)[0]
+        output_path = os.path.join(output_folder, item_name)
+        if os.path.isdir(output_path) and os.listdir(output_path):
+            print(f"{output_path} already exists")
+            return
+        os.makedirs(output_path, exist_ok=True)
+
+    filtergraph = (
+        f"fps={FRAMERATE},"
+        f"setpts=PTS-STARTPTS,"
+        f"scale='if(gt(iw,ih),-1,{HEIGHT})':'if(gt(iw,ih),{WIDTH},-1)'," # default temporal scaling filter -> bicubic
+        f"crop={WIDTH}:{HEIGHT}"
+    )
+
+    # FFmpeg command
+    command = [
+        "ffmpeg", "-loglevel", "error",
+        "-i", input_path,
+        "-t", str(DURATION),
+    ]
+
+    # Output: H.264 video
+    filtergraph_video = f"{filtergraph},scale=in_range=tv:out_range=tv,format=yuv420p"  # keep limited range
+    command_video = [
+        "-filter:v", filtergraph_video,
+        "-r", str(FRAMERATE),
+        "-c:v", "libx264",
+        "-crf", "18", # I sent Johannes videos encoded with crf 14 - but the quality difference is negligible
+        "-preset", "slow",
+        output_path
+    ]
+
+    # Output: JPEG frames
+    indices = [round(t * FRAMERATE) for t in FRAMES_DNN]  # [0,4,8,...,56,59]
+    select_expr = "+".join(f"eq(n\\,{n})" for n in indices)  # eq(n\,0)+eq(n\,4)+...
+
+    vf = (
+        f"{filtergraph},"
+        f"scale=in_range=tv:out_range=full,format=yuvj420p,"  # tv -> full for JPEG
+        f"select={select_expr}"
+    )
+    command_frames = [
+        "-vf", vf,
+        "-fps_mode", "passthrough",  # older ffmpeg: use "-vsync", "0"
+        "-q:v", "2", # high-quality JPEG, go toward 5 for more lossy encoding
+        os.path.join(output_path, "img_%05d.jpg")
+    ]
+
+    if encoding == "merger" or encoding == "human":
+        command += command_video
+    if encoding == "dnn":
+        command += command_frames
+
+    #print(f"Processing: {file_name}", flush=True)
+    try:
+        result = subprocess.run(
+            command,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True  # Automatically decodes output to str
+        )
+        #print(f"Finished: {file_name}", flush=True)
+    except subprocess.CalledProcessError as e:
+        print(f"\n⚠️ Error processing video file {file_name}", flush=True)
+        print(f"Return code: {e.returncode}", flush=True)
+        print(f"Stderr: {e.stderr}", flush=True)
+
+
+    # after the ffmpeg call for the frames branch - change the frame enumeration to the actual frame numbers
+    if encoding == "dnn":
+        written = sorted(glob.glob(os.path.join(output_path, "img_*.jpg")))
+        assert len(written) == len(indices), f"{len(written)} files vs {len(indices)} indices"
+
+        for src, n in zip(written, indices):
+            sink = os.path.join(output_path, f"frame_{n:05d}.jpg")
+            os.rename(src, sink)
+
+
+###############################################
+
+# Process audio files
+
+def get_channel_volumes(input_path):
+    command = [
+        "ffmpeg", "-nostats", "-i", input_path,
+        "-af", "astats=metadata=1:reset=1", "-f", "null", "-"
+    ]
+    try:
+        result = subprocess.run(command, stderr=subprocess.PIPE, stdout=subprocess.PIPE, check=True)
+        stderr = result.stderr.decode()
+
+        # Match RMS level for each channel
+        left_match = re.findall(r"Channel\s*:\s*1[\s\S]*?RMS level dB:\s*(-?\d+\.\d+)", stderr)
+        right_match = re.findall(r"Channel\s*:\s*2[\s\S]*?RMS level dB:\s*(-?\d+\.\d+)", stderr)
+
+        left_db = float(left_match[0]) if left_match else None
+        right_db = float(right_match[0]) if right_match else None
+
+        return left_db, right_db
+
+    except subprocess.CalledProcessError as e:
+        print("⚠️ FFmpeg failed for astats:\n", e.stderr.decode())
+        return None, None
+
+
+def process_audio(file_name, input_folder, output_folder, encoding, results, results_lock):
+    input_path = os.path.join(input_folder, file_name)
+    base_name = os.path.splitext(file_name)[0] # without suffix .m4a
+    output_name = f"{base_name}.wav"
+    if encoding == "merger":
+        output_name = f"{base_name}.m4a"
+    output_path = os.path.join(output_folder, output_name)
+    if os.path.exists(output_path):
+        print(f"{output_name} already exists")
+        return
+
+    # Step 0: Extract sample_rate and number of channels
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "a:0",
+        "-show_entries", "stream=sample_rate,channels",
+        "-of", "csv=p=0",
+        input_path
+    ]
+    try:
+        output = subprocess.check_output(cmd).decode().strip()
+        sample_rate_str, input_channels_str = output.split(',')
+        sample_rate_input = int(sample_rate_str)
+        input_channels = int(input_channels_str)
+    except Exception as e:
+        print(f"ERROR getting metadata for {file_name}: {e}")
+        sample_rate_input = 44100  # fallback, most common in data
+
+    NUM_SAMPLES = int(sample_rate_input * DURATION)
+
+
+    # Step 0.5: Detect stereo imbalance
+    threshold = 20
+    left_db = right_db = None
+    use_louder_channel = False
+    mono_source_channel = None
+    if input_channels == 2:
+        left_db, right_db = get_channel_volumes(input_path)
+        if left_db is not None and right_db is not None:
+            difference = abs(left_db - right_db)
+            if difference >= threshold:
+                use_louder_channel = True
+                mono_source_channel = "c0" if left_db > right_db else "c1"
+                print(f"⚠️ Stereo imbalance in {file_name}: L={left_db:.1f} dB, R={right_db:.1f} dB, difference = {difference} → using {mono_source_channel}", flush=True)
+
+
+    # Step 1: First pass to measure loudness
+    command_pass1 = [
+        "ffmpeg",
+        "-i", input_path,
+        "-af", "loudnorm=I=-24:LRA=7:TP=-2:dual_mono=true:print_format=json",
+        "-f", "null", "-"
+    ]
+
+    try:
+        result = subprocess.run(command_pass1, check=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
+        stderr_output = result.stderr.decode()
+
+        # Extract JSON block from stderr
+        match = re.search(r"\{[\s\S]*?\}", stderr_output)
+        if not match:
+            print(f"Loudness JSON not found for {file_name}",  flush=True)
+            return
+        loudness_data = json.loads(match.group(0))
+
+        # Extract measured values
+        I = loudness_data["input_i"]
+        LRA = loudness_data["input_lra"]
+        TP = loudness_data["input_tp"]
+        THRESH = loudness_data["input_thresh"]
+        OFFSET = loudness_data["target_offset"]
+
+    except subprocess.CalledProcessError as e:
+        print(f"Error in first loudness pass for {file_name}: {e}",  flush=True)
+        return
+
+    # Step 2: trim to 3.0 s,
+    # set # of channels,
+    # for humans -> normalise (apply measured loudness normalization using values from pass 1.)
+    # -> documentation: 8.97 loudnorm (https://ffmpeg.org/ffmpeg-filters.html#loudnorm),
+    # resample,
+    # export as wav/m4a
+
+    sample_rate = "44100"
+    channels = "2"  # stereo
+    encoding_format = "pcm_s16le"  # .wav with bit depth = 16
+    add_bitrate = False
+
+    if encoding == "dnn":
+        sample_rate = str(SAMPLERATE_DNN)
+        channels = str(NBCHANNELS_DNN)  # mono
+    elif encoding == "merger":
+        encoding_format = "aac"  # .m4a
+        add_bitrate = True # flag to add -b:a 128k later for .m4a
+
+    # Build audio filter chain
+    af_string = f"atrim=start_sample=0:end_sample={NUM_SAMPLES},"
+
+    if channels == "1":  # Target mono
+        if input_channels == 2:
+            if use_louder_channel:
+                af_string += f"pan=mono|c0={mono_source_channel},"
+            else:
+                af_string += "pan=mono|c0=0.5*c0+0.5*c1,"
+        elif input_channels == 6:
+            af_string += "pan=mono|c0=0.25*c0+0.25*c1+0.25*c2+0.125*c4+0.125*c5,"
+    elif channels == "2":  # Target stereo
+        if input_channels == 1:
+            af_string += "pan=stereo|c0=c0|c1=c0,"
+        elif input_channels == 6:
+            af_string += "pan=stereo|c0=0.6*c0+0.2*c2+0.2*c4|c1=0.6*c1+0.2*c2+0.2*c5,"
+        elif input_channels == 2:
+            if use_louder_channel:
+                af_string += f"pan=mono|c0={mono_source_channel},pan=stereo|c0=c0|c1=c0,"
+            else:
+                af_string += "pan=stereo|c0=c0|c1=c1,"
+
+        # Append loudnorm filter at the end
+        af_string += f"loudnorm=I=-24:LRA=7:TP=-2:"
+        if float(I) > 0: af_string += f"linear=false:"
+        else: af_string += (f"linear=true:"
+                            f"measured_I={I}:measured_TP={TP}:measured_LRA={LRA}:measured_thresh={THRESH}:offset={OFFSET}:")
+        af_string += "dual_mono=true:print_format=json,"
+
+    #af_string += f"aresample=resampler=soxr:out_sample_rate={sample_rate}," # for human data soxr was used (FFMPEG_PATH)
+    af_string += f"aresample=out_sample_rate={sample_rate},"
+
+    # Build command
+    command_pass2 = [
+        "ffmpeg", # FFMPEG_PATH, # built with resampler=soxr
+        "-loglevel", "info",  # allow loudnorm summary ###"error",
+        "-i", input_path,
+        "-af", af_string,
+        "-c:a", encoding_format,
+    ]
+
+    # Conditionally add bitrate if m4a
+    if add_bitrate:
+        command_pass2 += ["-b:a", "128k"]
+
+    # Final output path
+    command_pass2.append(output_path)
+
+    try:
+        result = subprocess.run(
+            command_pass2,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        #print(f"Finished: {file_name}", flush=True)
+        stderr_output = result.stderr.decode()
+
+        # Extract JSON block from stderr
+        match = re.search(r"\{[\s\S]*?\}", stderr_output)
+        if match:
+            loudness_data = json.loads(match.group(0))
+            loudness_data["File"] = file_name
+            with results_lock:
+                results.append(loudness_data)
+
+    except subprocess.CalledProcessError as e:
+        print(f"\n⚠️ Error processing audio file {file_name}", flush=True)
+        print(f"Return code: {e.returncode}", flush=True)
+        print(f"Stderr: {e.stderr}", flush=True)
+
+
+###############################################
+
+# Process files via concurrent computing (distribute to process_video() / process_audio())
+
+def reencode_files(csv_path, source_path, sink_path, filetype, encoding):
+    print("\nProcessing files - type", filetype, "...")
+    ### For audio: target = "dnn" # or target = "human"
+    if filetype == "mp4":
+        processing_function = process_video
+    elif filetype == "m4a":
+        processing_function = process_audio
+
+    # Read the CSV into a DataFrame (assuming "File" is the column name)
+    df = pd.read_csv(csv_path)
+
+    # Extract the filenames from the "File" column
+    file_names_to_process = df["File"].tolist()
+
+    # Get only the MP4 files in the input folder that are in the CSV list
+    files = [f for f in sorted(os.listdir(source_path)) if
+                   f.endswith("." + filetype) and f in file_names_to_process]
+
+    results = []
+    results_lock = threading.Lock()
+
+    # Number of threads to use
+    num_threads = min(len(files), os.cpu_count())  # Use as many threads as available CPU cores
+
+    # Process files concurrently
+    with ThreadPoolExecutor(max_workers=num_threads) as executor:
+        executor.map(processing_function, files,
+                     itertools.repeat(source_path),
+                     itertools.repeat(sink_path),
+                     itertools.repeat(encoding),
+                     itertools.repeat(results),
+                     itertools.repeat(results_lock),
+                     )
+
+    # Explicitly release threads early
+    executor.shutdown(wait=True)  # Ensures all threads finish before releasing resources
+
+    # After all files are processed
+    if results:
+        df = pd.DataFrame(results)
+        df.insert(0, "File", df.pop("File"))  # make first column
+        df = df.sort_values(by="File")
+        path = csv_path[:-4] + "_loudnorm_summary.csv"
+        df.to_csv(path, index=False)
+
+    print("Finished processing files - type", filetype)
+
+###############################################
+
+# Merge video and audio via concurrent computing
+
+def merge(file_name, video_folder, audio_folder, output_folder):
+    video_path = os.path.join(video_folder, file_name)
+    name = os.path.splitext(file_name)[0]
+    audio_path = os.path.join(audio_folder, name + ".m4a")
+    if not os.path.exists(video_path):
+        print(f"Skipping {file_name}: No matching video file found.")
+        return
+    # Check if the corresponding audio file exists
+    if not os.path.exists(audio_path):
+        print(f"Skipping {file_name}: No matching audio file found.")
+        return
+    output_path = os.path.join(output_folder, file_name)
+    if os.path.exists(output_path):
+        print(f"{name} already exists")
+        return
+
+    # FFmpeg command to merge audio and video
+    command = [
+        "ffmpeg", "-loglevel", "error",
+        "-i", video_path,  # Input MP4 video
+        "-i", audio_path,  # Input M4A audio
+        "-c", "copy",  # Copy both video and audio streams without re-encoding
+        "-map", "0:v:0",  # Use video stream from first input
+        "-map", "1:a:0",  # Use audio stream from second input
+        "-shortest",  # Stop encoding when the shortest input ends (prevents desync)
+        output_path  # e.g. 'output_merged.mp4'
+    ]
+
+    try:
+        result = subprocess.run(
+            command,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True  # Automatically decodes output to str
+        )
+        #print(f"Merged: {file_name}", flush=True)
+    except subprocess.CalledProcessError as e:
+        print(f"\n⚠️ Error merging {file_name}", flush=True)
+        print(f"Return code: {e.returncode}", flush=True)
+        print(f"Stderr: {e.stderr}", flush=True)
+
+
+def merge_video_audio(video_path, audio_path, merged_video_path):
+    print("\nMerging video + audio...")
+    # Get all video files
+    video_files = [f for f in sorted(os.listdir(video_path)) if f.endswith(".mp4")]
+
+    # Run merging in parallel
+    num_threads = min(len(video_files), os.cpu_count())  # Use available CPU cores
+
+    with ThreadPoolExecutor(max_workers=num_threads) as executor:
+        executor.map(merge, video_files,
+                     itertools.repeat(video_path),
+                     itertools.repeat(audio_path),
+                     itertools.repeat(merged_video_path))
+
+    # Explicitly release threads early
+    executor.shutdown(wait=True)  # Ensures all threads finish before releasing resources
+
+    print("Finished merging files")
+
+
+###############################################
