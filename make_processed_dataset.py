@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 import pandas as pd
 import shutil
-import processin_functions as process
+import processing_functions as process
 from config import DURATION, WIDTH, HEIGHT, FRAMERATE, NBFRAMES, SAMPLERATE_DNN, BITRATE_DNN
 
 
